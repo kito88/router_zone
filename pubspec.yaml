@@ -1,0 +1,52 @@
+name: router_zone
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.10.4 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  google_maps_flutter: ^2.5.3
+  flutter_polyline_points: ^3.1.0
+  geocoding: ^4.0.0
+  geolocator: ^14.0.2
+  url_launcher: ^6.2.5
+  http: ^1.6.0
+  flutter_typeahead: 5.2.0
+  firebase_core: ^4.3.0
+  firebase_auth: ^6.1.3
+  cloud_firestore: ^6.1.1
+  flutter_keyboard_visibility: ^6.0.0
+  speech_to_text: ^7.3.0  # Adicione esta
+  permission_handler: ^12.0.1 # Adicione esta (para garantir permissão de microfone)
+  pdf: ^3.11.1 
+  printing: ^5.11.1 
+  path_provider: ^2.1.2
+  shared_preferences: ^2.5.4
+  maps_toolkit: ^3.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+  wakelock_plus: ^1.2.8  # Adicione esta linha aqui
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon/
+    - assets/icon/logo_gp.png
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon/logo_gp.png"
+  adaptive_icon_background: "#0D47A1"
+  adaptive_icon_foreground: "assets/icon/logo_gp.png"

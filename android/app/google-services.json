@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "467654175381",
+    "project_id": "routerzone-76852",
+    "storage_bucket": "routerzone-76852.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:467654175381:android:cca8b3de2cb8cae175c99c",
+        "android_client_info": {
+          "package_name": "com.frankito.RouterZone"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCrbCUgHR-A5FZKzRAskuGwEUlGg2J5T5I"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:467654175381:android:4270071f6f00e3cb75c99c",
+        "android_client_info": {
+          "package_name": "com.frankito.router_zone"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCrbCUgHR-A5FZKzRAskuGwEUlGg2J5T5I"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

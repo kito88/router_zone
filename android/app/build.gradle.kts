@@ -1,3 +1,12 @@
+import java.util.Properties // Importação essencial para lidar com arquivos de propriedades
+
+// 1. ESTE BLOCO É O QUE ESTÁ FALTANDO NO SEU ARQUIVO:
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use { localProperties.load(it) }
+}
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
@@ -28,6 +37,7 @@ android {
         targetSdk = 36 //flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        manifestPlaceholders["MAPS_API_KEY"] = localProperties.getProperty("MAPS_API_KEY") ?: ""
     }
 
     buildTypes {

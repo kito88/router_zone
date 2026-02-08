@@ -1,3 +1,17 @@
+# --- SEGURANÇA ROUTER ZONE (Personalizado) ---
+# Protege a chave no Dart
+lib/config/secrets.dart
+
+# Protege a chave no iOS
+ios/Runner/Secrets.xcconfig
+
+# Protege variáveis de ambiente (se usar .env no futuro)
+.env
+
+# Configurações do Firebase (Recomendado ocultar se o repo for público)
+android/app/google-services.json
+ios/Runner/GoogleService-Info.plist
+
 # Miscellaneous
 *.class
 *.log
@@ -43,3 +57,4 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+/android/local.properties

@@ -27,9 +27,10 @@ dependencies:
   permission_handler: ^12.0.1 # Adicione esta (para garantir permissão de microfone)
   pdf: ^3.11.1 
   printing: ^5.11.1 
-  path_provider: ^2.1.2
+  path_provider: ^2.1.5
   shared_preferences: ^2.5.4
   maps_toolkit: ^3.1.0
+  share_plus: ^12.0.1
 
 dev_dependencies:
   flutter_test:

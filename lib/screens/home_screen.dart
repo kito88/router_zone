@@ -22,6 +22,10 @@ import 'package:flutter/services.dart'; // Necessário para ByteData e rootBundl
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:maps_toolkit/maps_toolkit.dart' as mt; // 'mt' de maps toolkit
 import 'package:google_maps_flutter/google_maps_flutter.dart'; // Mantém o original
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+import '../main.dart'; // 🎯 Isso faz a home_screen enxergar a chave global
 
 // Importações do seu projeto
 import '../models/delivery_point.dart';
@@ -35,7 +39,7 @@ class HomeScreen extends StatefulWidget {
   _HomeScreenState createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // ---------------------------------------------------------------------------
   // CONTROLADORES E SERVIÇOS
   // ---------------------------------------------------------------------------
@@ -52,11 +56,31 @@ class _HomeScreenState extends State<HomeScreen> {
   DeliveryPoint? _pontoPartida;
   DeliveryPoint? _pontoDestino;
   List<DeliveryPoint> _paradasIntermediarias = [];
+  Map<String, Offset> _posicoesMarcadoresNoEcran = {}; // Guarda a posição dos marcadores no ecrã para o modo desenho
 
   // Mapas e Marcadores
   Set<Marker> _markers = {};
   Set<Polyline> _polylines = {};
   final Map<int, BitmapDescriptor> _customIcons = {};
+
+  // --- ESTADO DO MODO DESENHO ---
+  bool _isProcessingIntersection = false; // Para evitar travamentos
+  bool _isDrawingMode = false; // Ativa/desativa o vidro transparente
+  List<Offset> _drawPathPoints = []; // Os pontos exatos onde o dedo passou na tela
+  List<DeliveryPoint> _tempReorderedList = []; // Para mostrar a ordem temporária enquanto o usuário arrasta
+  List<List<DeliveryPoint>> _gruposLassos = []; // Lista de sequências (Lasso 1, 2...)
+  List<Offset> _centrosDosLassos = []; // Para desenhar o número 1, 2, 3 no mapa
+  Set<String> _capturedIds = {}; // Para garantir que não pegamos o mesmo ponto duas vezes
+  List<List<Offset>> _historicoCaminhosLassos = []; // Guarda os desenhos anteriores
+  bool _lockMap = true; // Inicia travado para desenho.
+  // Adicione esta variável no topo da sua classe
+  List<List<LatLng>> _historicoLassosGPS = []; // Os laços convertidos para GPS
+  // Guardará as áreas desenhadas convertidas para o mapa
+  Set<Polygon> _polygonsLassos = {};
+
+  // Guardará as coordenadas GPS de onde cada número (1, 2, 3) deve flutuar
+  List<LatLng> _centrosLassosGPS = [];
+  
 
   // Estado da Rota e Regras de Negócio
   String _statusPlano = "Verificando...";
@@ -69,17 +93,52 @@ class _HomeScreenState extends State<HomeScreen> {
   double _valorDaRotaAtiva = 0.0; // Adicione esta linha
   String _tempoTotalEstimado = "0h 0min";
   bool _listaExpandida = false; // Controla o tamanho do mapa
+  String? _enderecoInicio; //Endereço de Partida
+  String? _enderecoFim; // Endereço de Destino
+  
+
+
+  // --- FUNÇÕES AUXILIARES DE DATA (Mantenha apenas ESTE bloco) ---
+
+  String _obterNomeMes(int mes) {
+    const meses = [
+      'Janeiro',
+      'Fevereiro',
+      'Março',
+      'Abril',
+      'Maio',
+      'Junho',
+      'Julho',
+      'Agosto',
+      'Setembro',
+      'Outubro',
+      'Novembro',
+      'Dezembro',
+    ];
+    return meses[mes - 1];
+  }
+
+  DateTime _inicioDoDia(DateTime d) =>
+      DateTime(d.year, d.month, d.day, 0, 0, 0);
+  DateTime _fimDoDia(DateTime d) =>
+      DateTime(d.year, d.month, d.day, 23, 59, 59);
+  DateTime _inicioDoMes(DateTime d) => DateTime(d.year, d.month, 1);
+  DateTime _fimDoMes(DateTime d) =>
+      DateTime(d.year, d.month + 1, 0, 23, 59, 59);
+
+  // --------------------------------------------------------------
 
   // Configurações de tempo
   int _tempoPorParadaMin = 10;
   int _tempoPausaMin = 0;
 
+  
   // Cores da Marca GP Roteiriza
   final Color _corPrimaria = const Color(0xFF4E2C22); // Marrom
   final Color _corDestaque = const Color(0xFFD45D3A); // Laranja
 
+  // 1. ATUALIZAÇÃO NO FIREBASE
   Future<void> _atualizarOrdemNoFirebase() async {
-    // Se não houver uma rota ativa carregada, não há nada para atualizar no servidor
     if (_rotaAtivaDocId == null) return;
 
     try {
@@ -93,10 +152,9 @@ class _HomeScreenState extends State<HomeScreen> {
           'lat': p.location.latitude,
           'lng': p.location.longitude,
           'tipo': p.tipo,
-          'concluida': p.concluida,
+          'concluida': p.concluida, // Verifique se no seu modelo é 'concluida' ou 'completed'
         }).toList(),
       });
-      // Opcional: Notificar o utilizador que a ordem foi guardada
       debugPrint("Ordem sincronizada com o Firebase");
     } catch (e) {
       debugPrint("Erro ao atualizar ordem: $e");
@@ -104,6 +162,162 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _mostrarPopupRelatorio(String titulo, double ganhos, double despesas) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(titulo),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(Icons.arrow_upward, color: Colors.green),
+              title: Text("Ganhos"),
+              trailing: Text("R\$ ${ganhos.toStringAsFixed(2)}"),
+            ),
+            ListTile(
+              leading: Icon(Icons.arrow_downward, color: Colors.red),
+              title: Text("Despesas"),
+              trailing: Text("R\$ ${despesas.toStringAsFixed(2)}"),
+            ),
+            Divider(),
+            Text(
+              "Saldo: R\$ ${(ganhos - despesas).toStringAsFixed(2)}",
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text("Fechar"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  //Função de Gerar Relatorio Diario
+  Future<void> _gerarRelatorioDiario() async {
+    // 1. O nome da variável DEVE ser 'dataSelecionada' aqui
+    DateTime? dataSelecionada = await showDatePicker(
+      context: context,
+      initialDate: DateTime.now(),
+      firstDate: DateTime(2024),
+      lastDate: DateTime.now(),
+    );
+
+    // 2. Só avançamos se o usuário escolheu uma data
+    if (dataSelecionada != null) {
+      // 3. Agora o Dart vai reconhecer o nome 'dataSelecionada' nestas linhas
+      await _gerarRelatorioPDF(
+        inicio: _inicioDoDia(dataSelecionada),
+        fim: _fimDoDia(dataSelecionada),
+        tituloPeriodo:
+            "RELATÓRIO DIÁRIO - ${dataSelecionada.day}/${dataSelecionada.month}",
+      );
+    }
+  }
+  
+  // Função auxiliar para solicitar o endereço de início ou fim
+  Future<void> _solicitarEndereco(bool isInicio) async {
+    print("🚨 Abrindo diálogo para: ${isInicio ? 'INÍCIO' : 'FIM'}");
+    TextEditingController _controller = TextEditingController();
+
+    // Se já existir um endereço, ele já aparece no campo para editar
+    _controller.text = isInicio
+        ? (_enderecoInicio ?? "")
+        : (_enderecoFim ?? "");
+
+    return showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(isInicio ? "📍 Ponto de Início" : "🏁 Destino Final"),
+          content: TextField(
+            controller: _controller,
+            decoration: const InputDecoration(
+              hintText: "Digite o endereço ou cidade...",
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text(
+                "CANCELAR",
+                style: TextStyle(color: Colors.grey),
+              ),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: isInicio ? Colors.green : Colors.red,
+              ),
+              onPressed: () {
+                setState(() {
+                  if (isInicio) {
+                    _enderecoInicio = _controller.text;
+                  } else {
+                    _enderecoFim = _controller.text;
+                  }
+                });
+                print("✅ Salvo: ${_controller.text}");
+                Navigator.pop(context); // Fecha a caixinha
+                _notificar("Local definido com sucesso!");
+              },
+              child: const Text("CONFIRMAR"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+
+  //Função de Gerar Relatorio Mensal
+  Future<void> _gerarRelatorioMensal(BuildContext context) async {
+    // 1. Abre o seletor de data
+    final DateTime? escolhida = await showDatePicker(
+      context: context,
+      initialDate: DateTime.now(),
+      firstDate: DateTime(2023), // De onde começam seus registros
+      lastDate: DateTime.now(),
+      helpText: "SELECIONE UM DIA DO MÊS DESEJADO",
+      cancelText: "CANCELAR",
+      confirmText: "GERAR RELATÓRIO",
+    );
+
+    // 2. Se o usuário não cancelou, calcula o intervalo do mês inteiro
+    if (escolhida != null) {
+      // Primeiro dia do mês escolhido
+      DateTime inicioMes = DateTime(escolhida.year, escolhida.month, 1);
+
+      // Último dia do mês escolhido
+      DateTime fimMes = DateTime(
+        escolhida.year,
+        escolhida.month + 1,
+        0,
+        23,
+        59,
+        59,
+      );
+
+      _notificar(
+        "Gerando relatório de ${escolhida.month}/${escolhida.year}...",
+      );
+
+      // 3. Chama a função do PDF que já está validada
+      await _gerarRelatorioPDF(
+        inicio: inicioMes,
+        fim: fimMes,
+        tituloPeriodo:
+            "FECHAMENTO MENSAL - ${escolhida.month}/${escolhida.year}",
+      );
+    }
+  }
+
+
+  //Função Padronização do banco de Dados
   Future<void> _padronizarBancoDeDados() async {
     try {
       _notificar("Padronizando banco... Aguarde.", cor: Colors.blue);
@@ -180,16 +394,6 @@ Future<String?> _buscarEnderecoPorCep(String cep) async {
   return null;
 }
 
-@override
-void dispose() {
-  // 1. Remove o ouvinte do CEP antes de fechar tudo
-  _searchController.removeListener(_ouvinteDeCep);
-  // 2. Fecha o controlador da barra de busca
-  _searchController.dispose();
-  // 3. Desliga o Wakelock (tela sempre acesa)
-  WakelockPlus.disable();
-  super.dispose();
-}
 
   void _selecionarRotaPendente() {
     final user = FirebaseAuth.instance.currentUser;
@@ -346,6 +550,7 @@ void dispose() {
                           ),
                           onTap: () => _gerarRelatorioPDF(
                             rotaUnica: rotaDoc,
+                            tituloPeriodo: "DETALHES DA ROTA"
                           ), // Gera PDF desta rota
                           title: Text(
                             rota['nome'] ?? "Rota",
@@ -421,11 +626,29 @@ void dispose() {
   void initState() {
     WakelockPlus.disable();
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _speech = stt.SpeechToText();
     _carregarRascunhoLocal();
     _verificarStatusAssinatura();
     _inicializarLocalizacaoComFoco();
     _searchController.addListener(_ouvinteDeCep);
+  }
+
+  @override
+  void dispose() {
+    // 🎯 IMPORTANTE: Remove o observador ao fechar a tela para não dar erro
+    WidgetsBinding.instance.removeObserver(this);
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  // 🎯 O XEQUE-MATE: Esta função limpa a barra fixa assim que o app volta a aparecer
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // No segundo que o Dr. Kito voltar para o app, a mensagem some!
+      messengerKey.currentState?.clearSnackBars();
+    }
   }
 
   void _dialogDespesas() {
@@ -531,12 +754,12 @@ void dispose() {
             TextField(
               controller: cepCtrl,
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: "CEP (apenas números)", hintText: "03548000"),
+              decoration: const InputDecoration(labelText: "CEP (apenas números)", hintText: "Digite o CEP..."),
             ),
             TextField(
               controller: numCtrl,
               keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: "Número", hintText: "216"),
+              decoration: const InputDecoration(labelText: "Número", hintText: "Digite o número do local..."),
             ),
           ],
         ),
@@ -547,6 +770,13 @@ void dispose() {
               String? enderecoBase = await _buscarEnderecoPorCep(cepCtrl.text);
               if (enderecoBase != null) {
                 String enderecoCompleto = "$enderecoBase, ${numCtrl.text}";
+                setState(() {
+                  if (tipoPonto == "partida") {
+                    _enderecoInicio = enderecoCompleto;
+                  } else if (tipoPonto == "destino") {
+                    _enderecoFim = enderecoCompleto;
+                  }
+                });
                 Navigator.pop(context);
                 // Agora chama sua função de Geocoding original com o endereço completo
                 _adicionarPontoDireto(enderecoCompleto, tipoPonto);
@@ -1132,18 +1362,26 @@ void dispose() {
   }
 
   // Criamos esta função auxiliar para não repetir código dentro do try/catch
-  void _processarResultadoGeocoding(
-    List<Location> locs,
-    String end,
-    String tipo,
-  ) {
+  void _processarResultadoGeocoding(List<Location> locs, String end, String tipo) {
     if (locs.isNotEmpty && mounted) {
+      LatLng novaLoc = LatLng(locs.first.latitude, locs.first.longitude);
+
+      // VERIFICAÇÃO DE DUPLICIDADE: Checa se já existe um ponto nestas coordenadas
+      bool jaExiste = _paradasIntermediarias.any((p) => 
+        (p.location.latitude == novaLoc.latitude && p.location.longitude == novaLoc.longitude)
+      );
+
+      if (jaExiste && tipo == "parada") {
+        _notificar("Este endereço já está na sua lista.", cor: Colors.orange);
+        return;
+      }
+
       var novo = DeliveryPoint(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
         address: end,
-        location: LatLng(locs.first.latitude, locs.first.longitude),
-        tipo:
-            _tipoSelecionado, // Garante que usa o Chip (Coleta/Entrega) selecionado
+        location: novaLoc,
+        tipo: _tipoSelecionado,
+        concluida: false,
       );
 
       setState(() {
@@ -1161,17 +1399,7 @@ void dispose() {
     }
   }
 
-  double _calcularDistancia(LatLng p1, LatLng p2) {
-    var p = 0.01745329;
-    var a =
-        0.5 -
-        cos((p2.latitude - p1.latitude) * p) / 2 +
-        cos(p1.latitude * p) *
-            cos(p2.latitude * p) *
-            (1 - cos((p2.longitude - p1.longitude) * p)) /
-            2;
-    return 12742 * asin(sqrt(a));
-  }
+  
 
   Future<void> _solicitarNumeroEAtualizar(String enderecoBase) async {
     TextEditingController numeroCtrl = TextEditingController();
@@ -1203,6 +1431,166 @@ void dispose() {
     _adicionarPontoDireto(endFinal, "parada");
   }
 
+
+  
+
+  void _limparVariaveisDesenho() {
+    setState(() {
+      _gruposLassos = [];
+      _polygonsLassos = {}; // Remove os laços laranjas
+      _centrosLassosGPS = []; // Remove os números 1, 2, 3
+      _capturedIds = {};
+      _drawPathPoints = [];
+      _lockMap = true; // Trava o mapa para o próximo uso
+    });
+  }
+
+  //funcao otimizacao automatica
+  void _otimizarAutomatico() async {
+    if (_paradasIntermediarias.length < 2) {
+      _notificar("Adicione pelo menos 2 paradas.");
+      return;
+    }
+
+    setState(() => _estaOtimizando = true);
+
+    // 1. Separa quem já foi entregue de quem falta entregar
+    List<DeliveryPoint> pendentes = _paradasIntermediarias.where((p) => !p.concluida).toList();
+    List<DeliveryPoint> concluidas = _paradasIntermediarias.where((p) => p.concluida).toList();
+    List<DeliveryPoint> otimizada = [];
+    
+    LatLng ref = _pontoPartida?.location ?? const LatLng(-23.5505, -46.6333);
+
+    // 2. Algoritmo de Vizinho Próximo
+    while (pendentes.isNotEmpty) {
+      pendentes.sort((a, b) {
+        double distA = _calcularDistancia(ref, a.location);
+        double distB = _calcularDistancia(ref, b.location);
+        return distA.compareTo(distB);
+      });
+
+      var proximo = pendentes.removeAt(0);
+      otimizada.add(proximo);
+      ref = proximo.location;
+    }
+
+    // 3. ATUALIZA O ESTADO COM A NOVA ORDEM
+    setState(() {
+      _paradasIntermediarias = [...otimizada, ...concluidas];
+      _estaOtimizando = false;
+      print("Otimização automática concluída. ${_paradasIntermediarias.length} Nova ordem aplicada.");
+    });
+
+    // 4. ESSENCIAL: DIZ AO MAPA PARA REDESENHAR TUDO
+    await _atualizarMarcadores(); // Atualiza os números (1, 2, 3...)
+    _carregarRotaNoMapa();        // Traça a nova linha azul/laranja
+    _atualizarOrdemNoFirebase(); // Salva no banco de dados
+    
+    _notificar("Rota otimizada com sucesso!", cor: Colors.green);
+  }
+
+
+  // 2. Esta função "congela" onde cada endereço está na tela no momento que você toca nela
+  void _prepararCapturaDePontos(Offset posicao) async {
+    _posicoesMarcadoresNoEcran.clear();
+    double pixelRatio = MediaQuery.of(context).devicePixelRatio;
+
+    for (var parada in _paradasIntermediarias) {
+      // Não pega quem já foi laçado ou concluído
+      if (_capturedIds.contains(parada.id) || parada.concluida) continue;
+
+      ScreenCoordinate screenCoord = await _mapController!.getScreenCoordinate(
+        parada.location,
+      );
+
+      // Converte a posição do GPS para pixels da tela do celular
+      _posicoesMarcadoresNoEcran[parada.id] = Offset(
+        screenCoord.x.toDouble() / pixelRatio,
+        screenCoord.y.toDouble() / pixelRatio,
+      );
+    }
+  }
+
+  // 3. Esta função checa se o seu dedo passou perto de algum endereço (Muito rápida!)
+  void _detectarIntersecaoRapida(Offset dedoPos) {
+    const double hitRadius = 45.0; // Sensibilidade do toque
+
+    _posicoesMarcadoresNoEcran.forEach((id, markerPos) {
+      if (!_capturedIds.contains(id)) {
+        double distance = (dedoPos - markerPos).distance;
+
+        if (distance < hitRadius) {
+          // Encontra o endereço na sua lista pelo ID
+          var parada = _paradasIntermediarias.firstWhere((p) => p.id == id);
+
+          setState(() {
+            _tempReorderedList.add(parada);
+            _capturedIds.add(id);
+          });
+          HapticFeedback.selectionClick(); // Vibração leve ao capturar
+        }
+      }
+    });
+  }
+
+  double _calcularDistanciaSimples(LatLng p1, LatLng p2) {
+    return (p1.latitude - p2.latitude).abs() +
+        (p1.longitude - p2.longitude).abs();
+  }
+
+
+
+  // Função auxiliar para cálculo de distância
+  double _calcularDistancia(LatLng p1, LatLng p2) {
+    return (p1.latitude - p2.latitude).abs() +
+        (p1.longitude - p2.longitude).abs();
+  }
+
+  //BOTÃO DE OPCAO CORRIGIDO
+  void _confirmarSequenciaLassos() async {
+    // 1. Usamos uma lista auxiliar para garantir que cada ponto entre apenas UMA VEZ
+    final List<DeliveryPoint> novaOrdemLimpa = [];
+    final Set<String> idsJaAdicionados = {};
+
+    for (var grupo in _gruposLassos) {
+      for (var ponto in grupo) {
+        // Só adiciona se o ponto ainda não estiver na nova lista
+        if (!idsJaAdicionados.contains(ponto.id)) {
+          novaOrdemLimpa.add(ponto);
+          idsJaAdicionados.add(ponto.id);
+        }
+      }
+    }
+
+    // 2. Pegamos quem SOBROU (quem você NÃO laçou)
+    List<DeliveryPoint> restantes = _paradasIntermediarias
+        .where((p) => !idsJaAdicionados.contains(p.id) && !p.concluida)
+        .toList();
+
+    // 3. Pegamos as concluídas
+    List<DeliveryPoint> concluidas = _paradasIntermediarias
+        .where((p) => p.concluida)
+        .toList();
+
+    // 4. Montamos a lista oficial SEM DUPLICADOS
+    setState(() {
+      _paradasIntermediarias = [...novaOrdemLimpa, ...restantes, ...concluidas];
+      _isDrawingMode = false;
+      _limparVariaveisDesenho();
+    });
+
+    // 5. ATUALIZAÇÃO VISUAL (Obrigatória para os números 1, 2, 3...)
+    _customIcons.clear();
+    await _atualizarMarcadores();
+    _carregarRotaNoMapa();
+    await _atualizarOrdemNoFirebase();
+
+    _notificar("Roteiro reordenado!", cor: Colors.blue);
+  }
+  
+
+
+  // funcao Otimizar
   void _otimizarRota() async {
     if (!_usuarioEhPro) {
       Navigator.push(
@@ -1236,49 +1624,377 @@ void dispose() {
       _estaOtimizando = false;
     });
     _carregarRotaNoMapa();
-    _notificar("Rota otimizada!", cor: Colors.green);
+    _notificar("Rota otimizada!", cor: const ui.Color.fromARGB(255, 223, 219, 15));
   }
+
 
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      drawer: _buildDrawer(),
-      appBar: AppBar(
-        title: const Text("Router Zone", style: TextStyle(fontSize: 16, color: Colors.white)),
-        backgroundColor: _corPrimaria,
-        iconTheme: const IconThemeData(color: Colors.white),
+      // O segredo está aqui: ValueKey faz o Flutter resetar o estado ao mudar o modo
+      body: KeyedSubtree(
+        key: ValueKey(_isDrawingMode),
+        child: _isDrawingMode ? _buildMapaFull() : _buildLayoutPadrao(),
       ),
-      // A mágica acontece aqui:
-      body: Column(
-        children: [
-          // 1. TOPO: Busca e Botões (Sempre visíveis)
-          _buildBarraBusca(),
-          _buildBotoesAcao(),
 
-          // 2. MEIO: Mapa e Lista Deslizante (Um sobre o outro)
-          Expanded(
-            child: Stack(
-              children: [
-                // O mapa fica ao fundo preenchendo o espaço
-                Positioned.fill(child: _buildAreaMapa()), 
-                
-                // A lista deslizante fica por cima do mapa
-                _buildListaDeslizante(), 
-              ],
+      drawer: _isDrawingMode ? null : _buildDrawer(),
+
+      appBar: AppBar(
+        title: Text(_isDrawingMode ? "Sequenciando Rota..." : "Router Zone"),
+        backgroundColor: _isDrawingMode ? Colors.orange : _corPrimaria,
+        leading: _isDrawingMode
+            ? IconButton(
+                icon: const Icon(Icons.close),
+                onPressed: () => setState(() {
+                  _isDrawingMode = false;
+                  _limparVariaveisDesenho();
+                }),
+              )
+            : null,
+        actions: !_isDrawingMode
+            ? [
+                IconButton(
+                  icon: const Icon(Icons.more_vert),
+                  onPressed: _mostrarOpcoesOtimizacao,
+                ),
+              ]
+            : null,
+      ),
+
+      floatingActionButton: _isDrawingMode && _gruposLassos.isNotEmpty
+          ? FloatingActionButton.extended(
+              backgroundColor: Colors.green,
+              onPressed:
+                  _confirmarSequenciaLassos, // Função que organiza a lista
+              label: Text("Finalizar e Roteirizar (${_gruposLassos.length})"),
+              icon: const Icon(Icons.check_circle),
+            )
+          : null,
+    );
+  }
+
+  //BUILD MAPA 100% (TELA CHEIA)
+  
+
+
+  Widget _buildNumerosSeguindoMapa() {
+    return FutureBuilder(
+      future: Future.wait(_centrosLassosGPS.map((gps) async {
+        return await _mapController?.getScreenCoordinate(gps);
+      })),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData || snapshot.data == null) return const SizedBox();
+        
+        var coordenadas = snapshot.data as List<ScreenCoordinate?>;
+        List<Widget> badges = [];
+
+        for (int i = 0; i < coordenadas.length; i++) {
+          var coord = coordenadas[i];
+          if (coord == null) continue;
+          
+          badges.add(
+            Positioned(
+              // Dividimos pelo pixelRatio para alinhar com o Flutter
+              left: (coord.x / MediaQuery.of(context).devicePixelRatio) - 15,
+              top: (coord.y / MediaQuery.of(context).devicePixelRatio) - 15,
+              child: CircleAvatar(
+                radius: 15,
+                backgroundColor: Colors.blue.withOpacity(0.9),
+                child: Text("${i + 1}", style: const TextStyle(color: Colors.white, fontSize: 12)),
+              ),
+            ),
+          );
+        }
+        return Stack(children: badges);
+      },
+    );
+  }
+
+  Widget _buildNumerosSobrepostos() {
+    return StreamBuilder(
+      // Este stream "ouve" o movimento da câmara para reposicionar os números
+      stream: Stream.periodic(const Duration(milliseconds: 100)),
+      builder: (context, snapshot) {
+        return Stack(
+          children: List.generate(_centrosLassosGPS.length, (index) {
+            return FutureBuilder<ScreenCoordinate?>(
+              future: _mapController?.getScreenCoordinate(
+                _centrosLassosGPS[index],
+              ),
+              builder: (context, coordSnapshot) {
+                if (!coordSnapshot.hasData || coordSnapshot.data == null)
+                  return const SizedBox();
+
+                double pixelRatio = MediaQuery.of(context).devicePixelRatio;
+                return Positioned(
+                  left: (coordSnapshot.data!.x / pixelRatio) - 15,
+                  top: (coordSnapshot.data!.y / pixelRatio) - 15,
+                  child: CircleAvatar(
+                    radius: 15,
+                    backgroundColor: Colors.blue,
+                    child: Text(
+                      "${index + 1}",
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                );
+              },
+            );
+          }),
+        );
+      },
+    );
+  }
+
+  //Mapa tela Cheia
+  Widget _buildMapaFull() {
+    return Stack(
+      children: [
+        // 1. O MAPA NATIVO
+        Positioned.fill(
+          child: GoogleMap(
+            key: const ValueKey("MAPA_INTERATIVO_LASSO_PRO"),
+            initialCameraPosition: CameraPosition(
+              target:
+                  _pontoPartida?.location ?? const LatLng(-23.5505, -46.6333),
+              zoom: 14,
+            ),
+            onMapCreated: (controller) => _mapController = controller,
+            markers: _markers,
+            polylines: _polylines,
+            polygons: _polygonsLassos,
+            myLocationEnabled: true,
+            scrollGesturesEnabled: !_lockMap,
+            zoomGesturesEnabled: !_lockMap,
+          ),
+        ),
+
+        // 2. CAMADA VISUAL DO DESENHO (O rastro azul do dedo)
+        Positioned.fill(
+          child: IgnorePointer(
+            child: CustomPaint(painter: RouteDrawingPainter(_drawPathPoints)),
+          ),
+        ),
+
+        // 3. CAPTURA DE TOQUE (SÓ ATIVO SE LOCKMAP FOR TRUE)
+        if (_lockMap)
+          Positioned.fill(
+            child: GestureDetector(
+              onPanStart: (details) {
+                setState(() {
+                  _drawPathPoints = [details.localPosition];
+                  _tempReorderedList = [];
+                });
+                _prepararCapturaDePontos(details.localPosition);
+              },
+              onPanUpdate: (details) {
+                setState(() => _drawPathPoints.add(details.localPosition));
+                _detectarIntersecaoRapida(details.localPosition);
+              },
+              onPanEnd: (details) async {
+                if (_drawPathPoints.length > 5) {
+                  double pixelRatio = MediaQuery.of(context).devicePixelRatio;
+                  List<LatLng> caminhoGPS = [];
+                  for (Offset ponto in _drawPathPoints) {
+                    LatLng? latLng = await _mapController?.getLatLng(
+                      ScreenCoordinate(
+                        x: (ponto.dx * pixelRatio).toInt(),
+                        y: (ponto.dy * pixelRatio).toInt(),
+                      ),
+                    );
+                    if (latLng != null) caminhoGPS.add(latLng);
+                  }
+
+                  setState(() {
+                    _gruposLassos.add(List.from(_tempReorderedList));
+                    _polygonsLassos.add(
+                      Polygon(
+                        polygonId: PolygonId(
+                          "Lasso_${DateTime.now().millisecondsSinceEpoch}",
+                        ),
+                        points: caminhoGPS,
+                        strokeWidth: 2,
+                        strokeColor: Colors.orange,
+                        fillColor: Colors.orange.withOpacity(0.15),
+                      ),
+                    );
+                    if (caminhoGPS.isNotEmpty)
+                      _centrosLassosGPS.add(caminhoGPS.first);
+                    _tempReorderedList = [];
+                    _drawPathPoints = [];
+                  });
+                  HapticFeedback.mediumImpact();
+                } else {
+                  if (_capturedIds.length ==_paradasIntermediarias.where((p) => !p.concluida).length) {
+                    _notificar("Todos os pontos já foram capturados!");
+                  } 
+                }
+              },
             ),
           ),
 
-          // 3. BASE: Painel Financeiro (Sempre fixo no rodapé)
-          _buildPainelInferior(),
-        ],
-      ),
+        // 4. CAMADA DE NÚMEROS (Badges 1, 2, 3...)
+        _buildNumerosSobreMapa(),
+
+        // 5. BOTÃO DE TRAVA (Cadeado/Lápis)
+        Positioned(
+          top: 20,
+          right: 20,
+          child: FloatingActionButton(
+            mini: true,
+            backgroundColor: _lockMap ? Colors.blue : Colors.grey[800],
+            onPressed: () => setState(() => _lockMap = !_lockMap),
+            child: Icon(
+              _lockMap ? Icons.edit : Icons.pan_tool,
+              color: Colors.white,
+            ),
+          ),
+        ),
+
+        // 6. BOTÃO DESFAZER (Aparece apenas se houver laços feitos)
+        if (_isDrawingMode && _gruposLassos.isNotEmpty)
+          Positioned(
+            top: 80,
+            right: 20,
+            child: FloatingActionButton(
+              mini: true,
+              backgroundColor: Colors.redAccent,
+              onPressed: _desfazerUltimoLasso,
+              child: const Icon(Icons.undo, color: Colors.white),
+            ),
+          ),
+      ],
     );
   }
+
+
+  //Widget dos Numeros
+  Widget _buildNumerosSobreMapa() {
+    return Stack(
+      children: List.generate(_centrosLassosGPS.length, (index) {
+        return FutureBuilder<ScreenCoordinate?>(
+          future: _mapController?.getScreenCoordinate(_centrosLassosGPS[index]),
+          builder: (context, snapshot) {
+            if (!snapshot.hasData || snapshot.data == null)
+              return const SizedBox();
+            double pixelRatio = MediaQuery.of(context).devicePixelRatio;
+            return Positioned(
+              left: (snapshot.data!.x / pixelRatio) - 15,
+              top: (snapshot.data!.y / pixelRatio) - 15,
+              child: CircleAvatar(
+                radius: 15,
+                backgroundColor: Colors.blue,
+                child: Text(
+                  "${index + 1}",
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      }),
+    );
+  }
+
+
+  Widget _buildInterfaceSobreposta() {
+    return Stack(
+      children: [
+        // Números dos Lassos
+        for (int i = 0; i < _centrosDosLassos.length; i++)
+          Positioned(
+            left: _centrosDosLassos[i].dx - 20,
+            top: _centrosDosLassos[i].dy - 20,
+            child: CircleAvatar(
+              radius: 20,
+              backgroundColor: Colors.orange.withOpacity(0.9),
+              child: Text(
+                "${i + 1}",
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+
+        // Botão Flutuante de Controle (Lápis / Mão)
+        Positioned(
+          top: 100,
+          right: 20,
+          child: FloatingActionButton(
+            mini: true,
+            backgroundColor: _lockMap ? Colors.blue : Colors.grey[800],
+            child: Icon(
+              _lockMap ? Icons.edit : Icons.pan_tool,
+              color: Colors.white,
+            ),
+            onPressed: () {
+              setState(() => _lockMap = !_lockMap);
+              _notificar(_lockMap ? "Modo Desenho" : "Modo Zoom/Mapa");
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLayoutPadrao() {
+    return Column(
+      children: [
+        _buildBarraBusca(),
+        _buildBotoesAcao(),
+        Expanded(
+          child: Stack(
+            children: [
+              // Adicionamos uma Key única aqui
+              Positioned.fill(
+                child: _buildAreaMapa(key: const ValueKey("MAPA_REDUZIDO")),
+              ),
+              _buildListaDeslizante(),
+            ],
+          ),
+        ),
+        _buildPainelInferior(),
+      ],
+    );
+  }
+
+
+  //Função Criar Lassos
+  void _limparLassos() {
+    setState(() {
+      _isDrawingMode = false;
+      _gruposLassos = [];
+      _capturedIds = {};
+      _drawPathPoints = [];
+      _historicoCaminhosLassos = []; // Se ainda usar
+
+      // ADICIONE ESTAS DUAS:
+      _polygonsLassos = {};
+      _centrosLassosGPS = [];
+
+      _lockMap = true;
+    });
+  }
+
+  //Finalizar e Roteirizar (A Sequência Correcta)
+  
+
 
   // ---------------------------------------------------------------------------
   // PERSISTÊNCIA E SALVAMENTO
   // ---------------------------------------------------------------------------
+
 
   void _salvarRotaDialog() {
     final user = FirebaseAuth.instance.currentUser;
@@ -1370,6 +2086,8 @@ void dispose() {
       ),
     );
   }
+
+
 
   Future<void> _executarSalvamento(
     String nome,
@@ -1511,204 +2229,239 @@ void dispose() {
   // Gerar RELATÓRIO PDF EXPORTAR FINANCEIRO
   Future<void> _gerarRelatorioPDF({
     DocumentSnapshot? rotaUnica,
-    DateTime? mesSelecionado,
+    DateTime? inicio,
+    DateTime? fim,
+    required String tituloPeriodo,
   }) async {
+    final pdf = pw.Document();
+    final user = FirebaseAuth.instance.currentUser;
+
+    // Função para garantir que o valor seja Double
+    double toD(dynamic v) => (v is num) ? v.toDouble() : 0.0;
+
+    final List<List<String>> dadosTabela = [
+      ['Data', 'Endereço', 'Recebido', 'Despesa'], // Cabeçalho
+    ];
+
     try {
-      _notificar("Gerando relatório profissional...", cor: Colors.blue);
+      double ganhosTotais = 0;
+      double despesasTotais = 0;
 
-      // 1. Carregamento do Logo dos Assets
-      final ByteData bytes = await rootBundle.load('assets/icon/logo_gp.png');
-      final Uint8List logoBytes = bytes.buffer.asUint8List();
-      final pw.MemoryImage logoImage = pw.MemoryImage(logoBytes);
+      // 1. BUSCA NAS ROTAS (Usando os nomes do PRINT)
+      var snapRotas = await FirebaseFirestore.instance
+          .collection('rotas') // Nome minúsculo do seu print
+          .where('userId', isEqualTo: user?.uid)
+          .where(
+            'dataExecucao',
+            isGreaterThanOrEqualTo: Timestamp.fromDate(inicio!),
+          )
+          .where('dataExecucao', isLessThanOrEqualTo: Timestamp.fromDate(fim!))
+          .get();
 
-      final pdf = pw.Document();
-      final hoje = DateTime.now();
-      final user = FirebaseAuth.instance.currentUser;
+      for (var d in snapRotas.docs) {
+        final dados = d.data() as Map<String, dynamic>;
+        DateTime dt = (dados['dataExecucao'] as Timestamp).toDate();
 
-      List<QueryDocumentSnapshot> rotas = [];
-      String titulo = "Relatório de Performance";
+        // Soma os valores que estão no DOCUMENTO (como mostra o seu print)
+        double valorRota =
+            toD(dados['valorRecebido']) + toD(dados['valorExtras']);
+        double despesaRota = toD(dados['valorDespesasRota']);
 
-      // 2. Lógica de Filtro (Rota Única ou Mensal)
-      if (rotaUnica != null) {
-        rotas = [rotaUnica as QueryDocumentSnapshot];
-        titulo = "DETALHE DA ROTA: ${rotaUnica['nome']}";
-      } else {
-        DateTime inicio = mesSelecionado ?? DateTime(hoje.year, hoje.month, 1);
-        final rSnap = await FirebaseFirestore.instance
-            .collection('rotas')
-            .where('userId', isEqualTo: user?.uid)
-            .where(
-              'dataExecucao',
-              isGreaterThanOrEqualTo: Timestamp.fromDate(inicio),
-            )
-            .get();
-        rotas = rSnap.docs;
-        titulo = "FECHAMENTO MENSAL - ${inicio.month}/${inicio.year}";
+        ganhosTotais += valorRota;
+        despesasTotais += despesaRota;
+
+        dadosTabela.add([
+          "${dt.day}/${dt.month}/${dt.year}",
+          dados['address'] ??
+              'Sem endereço', // Usei 'address' que vi no seu print
+          "R\$ ${valorRota.toStringAsFixed(2)}",
+          "R\$ ${despesaRota.toStringAsFixed(2)}",
+        ]);
       }
 
-      // 3. Montagem do PDF
+      // 2. MONTAGEM DA PÁGINA
       pdf.addPage(
-        pw.MultiPage(
-          // MultiPage é melhor para relatórios longos que podem pular de página
-          build: (pw.Context context) => [
-            // CABEÇALHO COM LOGO
-            pw.Row(
-              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-              crossAxisAlignment: pw.CrossAxisAlignment.center,
-              children: [
-                pw.Column(
-                  crossAxisAlignment: pw.CrossAxisAlignment.start,
-                  children: [
-                    pw.Text(
-                      titulo,
-                      style: pw.TextStyle(
-                        fontSize: 20,
-                        fontWeight: pw.FontWeight.bold,
-                      ),
-                    ),
-                    pw.Text(
-                      "Gerado em: ${hoje.day}/${hoje.month}/${hoje.year}",
-                      style: const pw.TextStyle(fontSize: 10),
-                    ),
-                    pw.Text(
-                      "Usuário: ${user?.email ?? 'Não identificado'}",
-                      style: const pw.TextStyle(fontSize: 10),
-                    ),
-                  ],
-                ),
-                pw.Container(width: 60, height: 60, child: pw.Image(logoImage)),
-              ],
-            ),
-            pw.SizedBox(height: 10),
-            pw.Divider(thickness: 1, color: PdfColors.grey300),
-            pw.SizedBox(height: 15),
-
-            // TABELA DE DADOS
-            pw.TableHelper.fromTextArray(
-              headerStyle: pw.TextStyle(
-                fontWeight: pw.FontWeight.bold,
-                color: PdfColors.white,
-              ),
-              headerDecoration: const pw.BoxDecoration(
-                color: PdfColors.blueGrey700,
-              ),
-              cellAlignment: pw.Alignment.centerLeft,
-              data: [
-                ['Data', 'Rota', 'KM', 'Líquido'],
-                ...rotas.map((r) {
-                  final dados = r.data() as Map<String, dynamic>;
-
-                  // Cálculos Seguros
-                  double valorBase = (dados['valorRecebido'] ?? 0.0).toDouble();
-                  double extras = (dados['valorExtras'] ?? 0.0).toDouble();
-                  double despesas = (dados['valorDespesasRota'] ?? 0.0)
-                      .toDouble();
-                  double liquido = (valorBase + extras) - despesas;
-
-                  String dataFormatada = "--/--";
-                  if (dados['dataExecucao'] != null) {
-                    DateTime dt = (dados['dataExecucao'] as Timestamp).toDate();
-                    dataFormatada = "${dt.day}/${dt.month}";
-                  }
-
-                  return [
-                    dataFormatada,
-                    dados['nome'] ?? "Sem nome",
-                    "${dados['kmTotal'] ?? 0} km",
-                    "R\$ ${liquido.toStringAsFixed(2)}",
-                  ];
-                }).toList(),
-              ],
-            ),
-
-            pw.SizedBox(height: 20),
-            pw.Align(
-              alignment: pw.Alignment.centerRight,
-              child: pw.Text(
-                "Router Zone - Otimização de Rotas",
-                style: const pw.TextStyle(
-                  fontSize: 8,
-                  color: PdfColors.grey600,
+        pw.Page(
+          build: (context) => pw.Column(
+            children: [
+              pw.Text(
+                tituloPeriodo,
+                style: pw.TextStyle(
+                  fontSize: 20,
+                  fontWeight: pw.FontWeight.bold,
                 ),
               ),
-            ),
-          ],
+              pw.SizedBox(height: 20),
+              pw.TableHelper.fromTextArray(context: context, data: dadosTabela),
+              pw.SizedBox(height: 20),
+              pw.Row(
+                mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+                children: [
+                  pw.Text(
+                    "Total Ganhos: R\$ ${ganhosTotais.toStringAsFixed(2)}",
+                  ),
+                  pw.Text(
+                    "Total Despesas: R\$ ${despesasTotais.toStringAsFixed(2)}",
+                  ),
+                  pw.Text(
+                    "Saldo: R\$ ${(ganhosTotais - despesasTotais).toStringAsFixed(2)}",
+                    style: pw.TextStyle(fontWeight: pw.FontWeight.bold),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       );
 
-      // 4. Disparo do PDF
-      await Printing.layoutPdf(
-        onLayout: (PdfPageFormat format) async => pdf.save(),
-      );
+      // 3. SALVAR E COMPARTILHAR (A parte nova)
+      // Primeiro, geramos os bytes do PDF
+      final bytes = await pdf.save();
+
+      // Pegamos a pasta temporária do celular
+      final dir = await getTemporaryDirectory();
+      final nomeArquivo =
+          'Relatorio_${DateTime.now().millisecondsSinceEpoch}.pdf';
+      final arquivo = File('${dir.path}/$nomeArquivo');
+
+      // Gravamos o arquivo
+      await arquivo.writeAsBytes(bytes);
+
+      // Abre a janela para escolher WhatsApp, E-mail, etc.
+      await Share.shareXFiles([
+        XFile(arquivo.path),
+      ], text: 'Segue o $tituloPeriodo do GPCargo.');
+
+      await Printing.layoutPdf(onLayout: (format) async => pdf.save());
     } catch (e) {
-      debugPrint("Erro ao gerar PDF: $e");
-      _notificar(
-        "Erro ao gerar PDF detalhado. Verifique o arquivo de logo.",
-        cor: Colors.red,
-      );
+      print("🆘 Erro Final: $e");
     }
   }
+
+
   // ---------------------------------------------------------------------------
   // NAVEGAÇÃO E FINALIZAÇÃO
   // ---------------------------------------------------------------------------
 
 
+  void _desfazerUltimaEntrega() async {
+    // Só podemos desfazer se o índice for maior que 0
+    if (_indiceEntregaAtual <= 0) return;
+
+    setState(() {
+      // 1. Volta o índice para a entrega anterior
+      _indiceEntregaAtual--;
+      
+      // 2. Marca a entrega anterior como NÃO concluída
+      _paradasIntermediarias[_indiceEntregaAtual].concluida = false;
+    });
+
+    // 3. Sincroniza com o Firebase
+    if (_rotaAtivaDocId != null) {
+      await FirebaseFirestore.instance
+          .collection('rotas')
+          .doc(_rotaAtivaDocId)
+          .update({
+        'paradas': _paradasIntermediarias.map((p) => {
+          'id': p.id,
+          'address': p.address,
+          'lat': p.location.latitude,
+          'lng': p.location.longitude,
+          'tipo': p.tipo,
+          'concluida': p.concluida,
+        }).toList(),
+      });
+    }
+    
+    _notificar("Ação desfeita!", cor: Colors.orange);
+  }
+
   // 1. SALVAR: Chama isso toda vez que adicionar ou remover algo
   
 
   void _avancarParaProximaEntrega() async {
+    print("🚀 Função ativa. Índice atual: $_indiceEntregaAtual");
     if (_paradasIntermediarias.isEmpty) return;
 
-    // 1. Se já estávamos em uma entrega, marca ela como concluída antes de ir para a próxima
-    if (_indiceEntregaAtual >= 0 &&
-        _indiceEntregaAtual < _paradasIntermediarias.length) {
+    // 1. LIMPEZA INICIAL: Mata qualquer mensagem "zumbi" antes de começar
+    // Usamos os dois comandos para garantir faxina total na messengerKey
+    messengerKey.currentState?.removeCurrentSnackBar();
+    messengerKey.currentState?.clearSnackBars();
+
+    // 2. ATUALIZAÇÃO VISUAL (Traço cinza aparece na hora)
+    if (_indiceEntregaAtual >= 0 && _indiceEntregaAtual < _paradasIntermediarias.length) {
       setState(() {
         _paradasIntermediarias[_indiceEntregaAtual].concluida = true;
       });
 
-      // Atualiza no Firebase para que, se o app fechar, a marcação continue lá
+      // Envia para o Firebase em segundo plano (sem await para não travar a tela)
       if (_rotaAtivaDocId != null) {
-        await FirebaseFirestore.instance
+        FirebaseFirestore.instance
             .collection('rotas')
             .doc(_rotaAtivaDocId)
             .update({
-              'paradas': _paradasIntermediarias
-                  .map(
-                    (p) => {
-                      'id': p.id,
-                      'address': p.address,
-                      'lat': p.location.latitude,
-                      'lng': p.location.longitude,
-                      'tipo': p.tipo,
-                      'concluida': p.concluida,
-                    },
-                  )
-                  .toList(),
-            });
+          'paradas': _paradasIntermediarias.map((p) => {
+            'id': p.id,
+            'address': p.address,
+            'lat': p.location.latitude,
+            'lng': p.location.longitude,
+            'tipo': p.tipo,
+            'concluida': p.concluida,
+          }).toList(),
+        }).catchError((e) => print("Erro ao sincronizar Firebase: $e"));
       }
     }
 
-    // 2. Avança o índice
+    // 3. PREPARA O SNACKBAR (Mensagem flutuante com botão DESFAZER)
+    final snackBar = SnackBar(
+      content: const Text("Entrega marcada como concluída"),
+      duration: const Duration(seconds: 4), // Tempo ideal para o motorista ler
+      behavior: SnackBarBehavior.floating,   // Flutua sobre os botões
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      action: SnackBarAction(
+        label: "DESFAZER",
+        textColor: Colors.yellow,
+        onPressed: () {
+          messengerKey.currentState?.hideCurrentSnackBar();
+          _desfazerUltimaEntrega();
+        },
+      ),
+    );
+
+    // 4. AVANÇA O ÍNDICE
     setState(() {
       _indiceEntregaAtual++;
     });
 
-    // 3. Abre o GPS para o novo destino ou finaliza
+    // 5. NAVEGAÇÃO OU FINALIZAÇÃO
     if (_indiceEntregaAtual < _paradasIntermediarias.length) {
       WakelockPlus.enable();
       LatLng dest = _paradasIntermediarias[_indiceEntregaAtual].location;
 
-      // Abre Google Maps
-      final url =
-          "google.navigation:q=${dest.latitude},${dest.longitude}&mode=d";
+      // Exibe a mensagem usando a Chave Global do main.dart
+      messengerKey.currentState?.showSnackBar(snackBar);
+
+      // 🎯 RESPIRO TÉCNICO: Aguarda o Android processar a barra antes de abrir o Maps
+      await Future.delayed(const Duration(milliseconds: 600));
+
+      final url = "google.navigation:q=${dest.latitude},${dest.longitude}&mode=d";
+      
       if (await canLaunchUrl(Uri.parse(url))) {
-        await launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+        // Abre o Maps sem 'await' para o Flutter continuar rodando o timer da msg
+        launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
       }
     } else {
+      // Roteiro finalizado
       WakelockPlus.disable();
       _notificar("Roteiro finalizado com sucesso!", cor: Colors.green);
-      if (_rotaAtivaDocId != null) _dialogConcluirRota();
-      _indiceEntregaAtual = -1;
+      
+      if (_rotaAtivaDocId != null) {
+        _dialogConcluirRota();
+      }
+      
+      setState(() {
+        _indiceEntregaAtual = -1; 
+      });
     }
   }
 
@@ -1903,30 +2656,205 @@ void dispose() {
     );
     _mapController!.animateCamera(CameraUpdate.newLatLngBounds(bounds, 70));
   }
+ 
+ 
+  Future<void> _checkIntersectionWithMarkers(Offset fingerPos) async {
+    if (_mapController == null || _paradasIntermediarias.isEmpty) return;
+
+    double pixelRatio = MediaQuery.of(context).devicePixelRatio;
+    const double hitRadius = 50.0;
+
+    for (var parada in _paradasIntermediarias) {
+      if (_capturedIds.contains(parada.id) || parada.concluida) continue;
+
+      ScreenCoordinate screenCoord = await _mapController!.getScreenCoordinate(
+        parada.location,
+      );
+
+      // Converte de FÍSICO (Mapa) para LÓGICO (Dedo)
+      Offset markerPos = Offset(
+        screenCoord.x.toDouble() / pixelRatio,
+        screenCoord.y.toDouble() / pixelRatio,
+      );
+
+      double distance = (fingerPos - markerPos).distance;
+
+      if (distance < hitRadius) {
+        setState(() {
+          _tempReorderedList.add(parada);
+          _capturedIds.add(parada.id);
+        });
+        HapticFeedback.selectionClick();
+      }
+    }
+  }
+
+
+  void _desfazerUltimoLasso() {
+    if (_gruposLassos.isEmpty) return;
+
+    setState(() {
+      // 1. Pega o último grupo capturado
+      List<DeliveryPoint> ultimoGrupo = _gruposLassos.removeLast();
+
+      // 2. Remove os IDs desse grupo da lista de "bloqueados"
+      for (var ponto in ultimoGrupo) {
+        _capturedIds.remove(ponto.id);
+      }
+
+      // 3. Remove o desenho (polígono) e o número flutuante correspondente
+      if (_polygonsLassos.isNotEmpty) {
+        _polygonsLassos.remove(_polygonsLassos.last);
+      }
+      if (_centrosLassosGPS.isNotEmpty) {
+        _centrosLassosGPS.removeLast();
+      }
+    });
+
+    _notificar("Último laço removido", cor: Colors.orange);
+  }
+
+
+  void _aplicarNovaOrdemDesenhada() async {
+    // 1. Verificação de segurança
+    if (_tempReorderedList.isEmpty) {
+      setState(() => _isDrawingMode = false);
+      return;
+    }
+
+    // 2. Filtramos usando o tipo CORRETO (DeliveryPoint)
+    // Pegamos quem não foi laçado e não está concluído
+    List<DeliveryPoint> restantes = _paradasIntermediarias
+        .where((p) => !_capturedIds.contains(p.id) && !p.concluida)
+        .toList();
+
+    // Pegamos quem já estava concluído (cinza)
+    List<DeliveryPoint> concluidos = _paradasIntermediarias
+        .where((p) => p.concluida)
+        .toList();
+
+    setState(() {
+      // Nova ordem: Laçados -> Restantes -> Concluídos
+      _paradasIntermediarias = [
+        ..._tempReorderedList,
+        ...restantes,
+        ...concluidos,
+      ];
+      _isDrawingMode = false;
+      _drawPathPoints = [];
+    });
+
+    // 3. Sincroniza com o Firebase
+    await _atualizarOrdemNoFirebase();
+
+    // 4. Feedback visual
+    _notificar("Rota reordenada manualmente!", cor: Colors.blue);
+  }
+
+  
+  
+
+  // DINAMICAR PERGUNTAR AO FORMA DE OTIMIZAR
+  void _mostrarOpcoesOtimizacao() {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) {
+        return Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.auto_fix_high, color: Colors.blue),
+              title: const Text("Otimização Automática"),
+              subtitle: const Text("O algoritmo calcula a rota mais rápida."),
+              onTap: () async {
+                Navigator.pop(context);
+                print("🖱️ Clique detectado na Otimização Automática");
+                // Aguarda um milissegundo para o modal fechar e não travar a UI
+                await Future.delayed(const Duration(milliseconds: 100));
+                _otimizarAutomatico();   // Garante que os marcadores estão atualizados antes de otimizar
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.gesture, color: Colors.orange),
+              title: const Text("Desenhar Roteiro (Lasso)"),
+              subtitle: const Text("Selecione os pontos desenhando no mapa."),
+              onTap: () {
+                Navigator.pop(context);
+                // 1. Antes de expandir o mapa, garante que os marcadores foram criados
+                _atualizarMarcadores();
+                setState(() {
+                  _isDrawingMode = true;
+                  // A mágica: Ativamos o modo desenho e o mapa expande
+                  // 2. Dá um pequeno tempo para o mapa expandir e ajusta a visão
+                  Future.delayed(const Duration(milliseconds: 300), () {
+                    _ajustarCameraMapa();
+                  });
+                });
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+
+  
 
   Future<void> _atualizarMarcadores() async {
+    print("🔄 Atualizando Marcadores numerados...");
+    _customIcons.clear(); // Limpa os ícones personalizados para evitar acúmulo
     Set<Marker> newMarkers = {};
-    if (_pontoPartida != null)
+
+    // 1. MARCADOR DE PARTIDA (Verde)
+    if (_pontoPartida != null) {
       newMarkers.add(
         Marker(
-          markerId: const MarkerId('p'),
+          markerId: const MarkerId('partida'),
           position: _pontoPartida!.location,
-          icon: BitmapDescriptor.defaultMarkerWithHue(
-            BitmapDescriptor.hueGreen,
-          ),
-        ),
-      );
-    for (int i = 0; i < _paradasIntermediarias.length; i++) {
-      final icon = await _gerarIconeNumerado(i + 1);
-      newMarkers.add(
-        Marker(
-          markerId: MarkerId(_paradasIntermediarias[i].id),
-          position: _paradasIntermediarias[i].location,
-          icon: icon,
+          infoWindow: const InfoWindow(title: "Início"),
+          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
         ),
       );
     }
-    setState(() => _markers = newMarkers);
+
+    // 2. MARCADORES DAS PARADAS (Numerados e Sequenciais)
+    // Como usamos o índice 'i', a numeração SEMPRE seguirá a ordem da lista
+    // PARADAS (Numeradas estritamente de 1 até o total da lista)
+    for (int i = 0; i < _paradasIntermediarias.length; i++) {
+      final ponto = _paradasIntermediarias[1];
+      final icon = await _gerarIconeNumerado(i + 1); // Garante a sequência 1, 2, 3...
+      newMarkers.add(Marker(
+        markerId: MarkerId(_paradasIntermediarias[i].id),
+        position: _paradasIntermediarias[i].location,
+        icon: icon,
+        infoWindow: InfoWindow(title: "Parada ${i + 1}"),
+      ));
+    }
+
+    if (mounted) {
+      setState(() => _markers = newMarkers);
+    }
+  
+    // 3. MARCADOR DE DESTINO FINAL (Vermelho - Opcional)
+    if (_pontoDestino != null) {
+      newMarkers.add(
+        Marker(
+          markerId: const MarkerId('destino'),
+          position: _pontoDestino!.location,
+          infoWindow: const InfoWindow(title: "Destino Final"),
+          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
+        ),
+      );
+    }
+
+    if (mounted) {
+      setState(() {
+        _markers = newMarkers;
+      });
+    }
   }
 
   Future<BitmapDescriptor> _gerarIconeNumerado(int number) async {
@@ -1980,7 +2908,7 @@ void dispose() {
                     controller: ctrl,
                     focusNode: node,
                     decoration: InputDecoration(
-                      hintText: "Buscar endereço ou CEP...",
+                      hintText: "Buscar por CEP ou Endereço...",
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(10),
                       ),
@@ -2007,7 +2935,7 @@ void dispose() {
                   ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
                   : const Icon(Icons.bolt),
                 color: Colors.blue, // Cor azul para diferenciar da voz
-                onPressed: _otimizarRota,
+                onPressed: _mostrarOpcoesOtimizacao,
                 tooltip: "Otimizar Rota",
               ),
             ],
@@ -2058,11 +2986,29 @@ void dispose() {
         child: Row(
           children: [
             const SizedBox(width: 10),
-            _botaoPequeno("INÍCIO", () => _adicionarPontoDireto(_searchController.text, "partida"), Colors.green),
+            // Localize o seu _buildBotoesAcao e mude apenas estas duas linhas:
+            // No seu Row de botões:
+            _botaoPequeno(
+              _enderecoInicio != null ? "INÍCIO OK" : "INÍCIO",
+              () => _dialogBuscaCep("partida"), // Chama a sua função de CEP
+              Colors.green,
+            ),
+
             const SizedBox(width: 5),
-            _botaoPequeno("+ PARADA", () => _adicionarPontoDireto(_searchController.text, "parada"), _corPrimaria),
+
+            _botaoPequeno(
+              "+ PARADA",
+              () => _dialogBuscaCep("parada"),
+              _corPrimaria,
+            ),
+
             const SizedBox(width: 5),
-            _botaoPequeno("FIM", () => _adicionarPontoDireto(_searchController.text, "destino"), Colors.red),
+
+            _botaoPequeno(
+              _enderecoFim != null ? "FIM OK" : "FIM",
+              () => _dialogBuscaCep("destino"), // Chama a sua função de CEP
+              Colors.red,
+            ),
             
             const Padding(
               padding: EdgeInsets.symmetric(horizontal: 10),
@@ -2149,8 +3095,14 @@ void dispose() {
                     final ponto = _paradasIntermediarias[i];
 
                     return ListTile(
-                      key: ValueKey(ponto.id), // Essencial para o Reorderable funcionar
+                      key: ValueKey(ponto.id),
                       dense: true,
+                      // 🎯 CLIQUE PARA DESFAZER
+                      onTap: () {
+                        if (ponto.concluida) {
+                          _dialogDesfazerEntrega(i);
+                        }
+                      },
                       leading: CircleAvatar(
                         radius: 12,
                         backgroundColor: ponto.concluida 
@@ -2164,16 +3116,13 @@ void dispose() {
                         ponto.address,
                         style: TextStyle(
                           fontSize: 11, 
-                          decoration: ponto.concluida ? TextDecoration.lineThrough : null,
+                          decoration: ponto.concluida ? TextDecoration.lineThrough : TextDecoration.none,
                           color: ponto.concluida ? Colors.grey : Colors.black,
                         ),
                       ),
-                      
-                      // --- OS BOTÕES QUE VOLTARAM: ---
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          // BOTÃO EXCLUIR (Só aparece se a parada não estiver concluída)
                           if (!ponto.concluida)
                             IconButton(
                               icon: const Icon(Icons.remove_circle_outline, color: Colors.red, size: 20),
@@ -2181,12 +3130,10 @@ void dispose() {
                                 setState(() {
                                   _paradasIntermediarias.removeAt(i);
                                 });
-                                _carregarRotaNoMapa(); // Atualiza o mapa
-                                _atualizarOrdemNoFirebase(); // Sincroniza exclusão no banco
+                                _carregarRotaNoMapa();
+                                _atualizarOrdemNoFirebase();
                               },
                             ),
-                          
-                          // ÍCONE DE ARRASTAR (Indica que pode ordenar)
                           Icon(
                             _usuarioEhPro ? Icons.drag_handle : Icons.lock_outline,
                             color: Colors.grey[400],
@@ -2205,18 +3152,107 @@ void dispose() {
     );
   }
 
-  Widget _buildAreaMapa() {
+  // Adicionamos o {Key? key} entre chaves para torná-lo um parâmetro nomeado opcional
+  Widget _buildAreaMapa({required Key key}) {
+    // Exigimos a Key agora
     return SizedBox(
-      height: MediaQuery.of(context).size.height * 0.30, // Define 35% da tela para o mapa
+      height: MediaQuery.of(context).size.height * 0.30,
       child: GoogleMap(
+        key: const ValueKey("mapa_reduzido_padrao"),
         initialCameraPosition: CameraPosition(
           target: _pontoPartida?.location ?? const LatLng(-23.5505, -46.6333),
           zoom: 12,
         ),
         onMapCreated: (controller) => _mapController = controller,
-        polylines: _polylines,
         markers: _markers,
+        polylines: _polylines,
         myLocationEnabled: true,
+      ),
+    );
+  }
+
+
+
+  Widget _buildAreaMapaFull() {
+    return GoogleMap(
+      key: const ValueKey("MAPA_ESTATICO_NORMAL_PRO"),
+      initialCameraPosition: CameraPosition(
+        target: _pontoPartida?.location ?? const LatLng(-23.5505, -46.6333),
+        zoom: 14,
+      ),
+      onMapCreated: (controller) {
+        _mapController = controller;
+        // No modo full, damos um ajuste de câmera imediato
+        Future.delayed(const Duration(milliseconds: 300), () {
+          _ajustarCameraMapa();
+        });
+      },
+      // IMPORTANTE: Manter os mesmos markers e polylines para os endereços aparecerem
+      markers: _markers,
+      polylines: _polylines,
+      myLocationEnabled: true,
+      // No modo desenho, o mapa fica "congelado" para o dedo riscar a tela
+      scrollGesturesEnabled: !_lockMap,
+      zoomGesturesEnabled: !_lockMap,
+      rotateGesturesEnabled: false,
+      tiltGesturesEnabled: false,
+    );
+  }
+
+  //funcao desfazer endereço marcado como concluido
+  void _dialogDesfazerEntrega(int index) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text("Desfazer Conclusão?"),
+        content: Text(
+          "Deseja marcar a entrega em '${_paradasIntermediarias[index].address}' como pendente novamente?",
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("CANCELAR"),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+            onPressed: () async {
+              Navigator.pop(context); // Fecha o diálogo
+
+              setState(() {
+                _paradasIntermediarias[index].concluida = false;
+                // Opcional: ajustar o índice atual para voltar a esta entrega
+                _indiceEntregaAtual = index;
+              });
+
+              // Atualiza o Firebase para persistir a mudança
+              if (_rotaAtivaDocId != null) {
+                try {
+                  await FirebaseFirestore.instance
+                      .collection('rotas')
+                      .doc(_rotaAtivaDocId)
+                      .update({
+                        'paradas': _paradasIntermediarias
+                            .map(
+                              (p) => {
+                                'id': p.id,
+                                'address': p.address,
+                                'lat': p.location.latitude,
+                                'lng': p.location.longitude,
+                                'tipo': p.tipo,
+                                'concluida': p.concluida,
+                              },
+                            )
+                            .toList(),
+                      });
+                  _notificar("Entrega reaberta com sucesso!");
+                } catch (e) {
+                  print("Erro ao desfazer no Firebase: $e");
+                }
+              }
+            },
+            child: const Text("SIM, DESFAZER"),
+          ),
+        ],
       ),
     );
   }
@@ -2237,6 +3273,7 @@ void dispose() {
 
     String textoBotao = "INICIAR";
     IconData iconeBotao = Icons.play_arrow;
+    
 
     if (_indiceEntregaAtual >= 0) {
       if (_indiceEntregaAtual < _paradasIntermediarias.length - 1) {
@@ -2337,14 +3374,33 @@ void dispose() {
                   ),
                 const SizedBox(width: 10),
                 ElevatedButton.icon(
-                  onPressed: _avancarParaProximaEntrega,
-                  icon: Icon(iconeBotao),
-                  label: Text(textoBotao),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: _corDestaque,
-                    foregroundColor: Colors.white,
-                  ),
-                ),  
+                    // 🎯 MUDANÇA AQUI: Interceptamos o clique para mostrar o aviso de privacidade
+                    onPressed: () async {
+                      if (textoBotao == "INICIAR") {
+                        // 1. Abre a "memória" do celular
+                        final prefs = await SharedPreferences.getInstance();
+                        
+                        // 2. Verifica se ele já aceitou a privacidade (valor padrão é false)
+                        bool jaAceitouPrivacidade = prefs.getBool('privacidade_aceita') ?? false;
+
+                        if (jaAceitouPrivacidade) {
+                          // Se já aceitou antes, vai direto para a verificação técnica/GPS
+                          _solicitarPermissaoTecnica();
+                        } else {
+                          // Se é a primeira vez, mostra o aviso da GP Solução
+                          _exibirAvisoPrivacidade(context);
+                        }
+                      } else {
+                        _avancarParaProximaEntrega();
+                      }
+                    },
+                    icon: Icon(iconeBotao),
+                    label: Text(textoBotao),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _corDestaque,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),  
               ],
             ),
           );
@@ -2406,46 +3462,35 @@ void dispose() {
               _carregarRotaNoMapa();
             },
             itemBuilder: (context, i) {
-              // Criamos uma referência local para facilitar a leitura
               final ponto = _paradasIntermediarias[i];
 
               return ListTile(
                 key: ValueKey(ponto.id),
-                // --- ÍCONE À ESQUERDA (Muda se estiver concluído) ---
+                // 🎯 CLIQUE PARA DESFAZER (Sincronizado)
+                onTap: () {
+                  if (ponto.concluida) {
+                    _dialogDesfazerEntrega(i);
+                  }
+                },
                 leading: CircleAvatar(
                   backgroundColor: ponto.concluida
-                      ? Colors
-                            .grey // Cinza se finalizado
+                      ? Colors.grey
                       : (ponto.tipo == "COLETA" ? Colors.green : _corDestaque),
                   child: ponto.concluida
-                      ? const Icon(
-                          Icons.check,
-                          color: Colors.white,
-                          size: 15,
-                        ) // Check
-                      : Text(
-                          "${i + 1}",
-                          style: const TextStyle(color: Colors.white, fontSize: 12),
-                        ),
+                      ? const Icon(Icons.check, color: Colors.white, size: 15)
+                      : Text("${i + 1}", style: const TextStyle(color: Colors.white, fontSize: 12)),
                 ),
-
-                // --- TEXTO DO ENDEREÇO (Risca se estiver concluído) ---
                 title: Text(
                   ponto.address,
                   style: TextStyle(
                     fontSize: 12,
                     color: ponto.concluida ? Colors.grey : Colors.black,
-                    decoration: ponto.concluida
-                        ? TextDecoration.lineThrough
-                        : null, // Efeito riscado
+                    decoration: ponto.concluida ? TextDecoration.lineThrough : TextDecoration.none,
                   ),
                 ),
-
-                // --- ÍCONES À DIREITA ---
                 trailing: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    // Só mostramos o botão de excluir se a parada ainda não foi feita
                     if (!ponto.concluida)
                       IconButton(
                         icon: const Icon(Icons.close, color: Colors.red, size: 20),
@@ -2456,7 +3501,6 @@ void dispose() {
                           _carregarRotaNoMapa();
                         },
                       ),
-                    // Ícone de Reordenação
                     Icon(
                       _usuarioEhPro ? Icons.drag_handle : Icons.lock_outline,
                       color: Colors.grey,
@@ -2553,7 +3597,7 @@ void dispose() {
             title: const Text("Relatório de Hoje"),
             onTap: () {
               Navigator.pop(context);
-              _gerarRelatorioPDF();
+              _gerarRelatorioDiario();
             },
           ),
           ListTile(
@@ -2562,10 +3606,7 @@ void dispose() {
             onTap: () {
               Navigator.pop(context);
               // Gera do mês atual começando no dia 1
-              DateTime agora = DateTime.now();
-              _gerarRelatorioPDF(
-                mesSelecionado: DateTime(agora.year, agora.month, 1),
-              );
+              _gerarRelatorioMensal(context);//
             },
           ),
 
@@ -2595,6 +3636,128 @@ void dispose() {
     );
   }
 
+
+  // FUNCAO EXIBIR AVISO DE PRIVACIDADE ANTES DE INICIAR A ROTA
+  void _exibirAvisoPrivacidade(BuildContext context) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(15),
+          ),
+          title: const Text("🛡️ GP Roteiriza - Privacidade"),
+          content: const Text(
+            "Para o funcionamento do GP Roteiriza, a GP Solução coleta dados de localização para permitir "
+            "o monitoramento da carga e a atualização do status de entrega em tempo real para o TMS, "
+            "inclusive quando o app está fechado ou não está em uso (em segundo plano).\n\n"
+            "Deseja permitir a coleta para iniciar a rota?",
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text(
+                "AGORA NÃO",
+                style: TextStyle(color: Colors.grey),
+              ),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blue[900],
+              ),
+              onPressed: () async {
+                // 1. Salva na memória que o usuário aceitou
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setBool('privacidade_aceita', true);
+                Navigator.pop(context);
+                // 🚀 Após concordar, o app inicia a rota de fato!
+                _solicitarPermissaoTecnica();
+              },
+              child: const Text("CONCORDAR E INICIAR"),
+              
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  //FUNCAO PARA SOLICITAR PERMISSÃO DE LOCALIZAÇÃO (APÓS O USUÁRIO CONCORDAR COM O AVISO)
+  Future<void> _solicitarPermissaoTecnica() async {
+    print("🚨 Aguardando foco da janela...");
+    
+    // 1. Dá um tempo para o diálogo fechar e o foco voltar para a MainActivity
+    await Future.delayed(const Duration(milliseconds: 500));
+
+    // 2. Tenta pedir a permissão básica
+    var statusInUse = await Permission.locationWhenInUse.request();
+    print("📡 Status 'Durante o uso' após delay: $statusInUse");
+
+    if (statusInUse.isGranted) {
+      // 3. Pede a de segundo plano (Sempre permitir)
+      var statusAlways = await Permission.locationAlways.request();
+      
+      if (statusAlways.isGranted) {
+        _avancarParaProximaEntrega();
+      } else {
+        _mostrarAvisoConfiguracaoManual();
+      }
+    } 
+    else if (statusInUse.isPermanentlyDenied) {
+      // Se o usuário negou várias vezes, o Android trava. Temos que abrir as configurações.
+      _mostrarAvisoConfiguracaoManual();
+    }
+    else {
+      _notificar("O Android negou o pedido. Tente clicar em INICIAR novamente.", cor: Colors.orange);
+    }
+  }
+
+  void _mostrarAvisoConfiguracaoManual() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+        title: const Text("⚠️ Ação Necessária"),
+        content: const Text(
+          "Para o GP Roteiriza funcionar, você precisa ativar a localização manualmente:\n\n"
+          "1. Clique em 'ABRIR CONFIGURAÇÕES'\n"
+          "2. Vá em 'Permissões'\n"
+          "3. Selecione 'Localização'\n"
+          "4. Marque 'PERMITIR O TEMPO TODO'",
+        ),
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.blue[800]),
+            onPressed: () async {
+              // 🎯 Adicionamos o async
+              Navigator.pop(context); // Fecha o diálogo
+
+              // Aguarda um milésimo de segundo para o diálogo fechar totalmente
+              await Future.delayed(const Duration(milliseconds: 200));
+
+              // Chama o comando de abrir as configurações
+              bool abriu = await openAppSettings();
+
+              if (!abriu) {
+                _notificar(
+                  "Não foi possível abrir as configurações automaticamente.",
+                  cor: Colors.red,
+                );
+              }
+            },
+            child: const Text(
+              "ABRIR CONFIGURAÇÕES",
+              style: TextStyle(color: Colors.white),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+  
+  // funçao limpar rota total
   void _limparRotaTotal() async {
     final prefs = await SharedPreferences.getInstance(); prefs.remove('rascunho_rota');
     setState(() {
@@ -2611,12 +3774,15 @@ void dispose() {
   }
 
   // Função para mostrar mensagens (Snackbar)
-  void _notificar(String msg, {Color cor = Colors.black87}) {
-    ScaffoldMessenger.of(context).showSnackBar(
+  void _notificar(String msg, {Color cor = Colors.blue}) {
+    // 🎯 Usa a chave global para garantir que NADA fique travado
+    messengerKey.currentState?.clearSnackBars(); 
+    messengerKey.currentState?.showSnackBar(
       SnackBar(
         content: Text(msg),
         backgroundColor: cor,
-        duration: const Duration(seconds: 2),
+        duration: const Duration(seconds: 3),
+        behavior: SnackBarBehavior.floating, // Flutua para não bugar com o teclado
       ),
     );
   }
@@ -2676,3 +3842,29 @@ class DesenhoPainter extends CustomPainter {
 }
 
 
+class RouteDrawingPainter extends CustomPainter {
+  final List<Offset> currentPath;
+
+  RouteDrawingPainter(this.currentPath);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (currentPath.length < 2) return;
+
+    final paint = Paint()
+      ..color = Colors.blue
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..strokeJoin = StrokeJoin.round
+      ..strokeWidth = 4.0;
+
+    Path path = Path()..moveTo(currentPath.first.dx, currentPath.first.dy);
+    for (var point in currentPath) {
+      path.lineTo(point.dx, point.dy);
+    }
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant RouteDrawingPainter oldDelegate) => true;
+}
